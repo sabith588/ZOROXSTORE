@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -42,7 +43,7 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT, title TEXT, session_string TEXT,
+            category TEXT, title TEXT, session_string TEXT, password TEXT DEFAULT 'none',
             price REAL DEFAULT 50.0, is_sold INTEGER DEFAULT 0, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -50,9 +51,14 @@ def init_db():
     
     cursor.execute("CREATE TABLE IF NOT EXISTS promos (code TEXT PRIMARY KEY, amount REAL, uses INTEGER DEFAULT 0, max_uses INTEGER)")
     cursor.execute("CREATE TABLE IF NOT EXISTS claimed_promos (user_id INTEGER, code TEXT)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS purchases (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, category TEXT, title TEXT, session_string TEXT, price REAL, bought_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS purchases (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, category TEXT, title TEXT, session_string TEXT, password TEXT DEFAULT 'none', price REAL, bought_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
 
+    # Ensure backwards compatibility for older DBs
     try: cursor.execute("ALTER TABLE purchases ADD COLUMN category TEXT")
+    except: pass
+    try: cursor.execute("ALTER TABLE accounts ADD COLUMN password TEXT DEFAULT 'none'")
+    except: pass
+    try: cursor.execute("ALTER TABLE purchases ADD COLUMN password TEXT DEFAULT 'none'")
     except: pass
 
     defaults = {
@@ -245,6 +251,7 @@ async def logout_acc_bot(session_str):
 # --- 4. CORE BOT ROUTING ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    context.user_data['state'] = None # Clear state on start
     
     if get_set("maintenance_mode") == "1" and not is_admin(user.id):
         await update.message.reply_text("🛠️ <b>System Upgrade</b>\n\nOur store is currently undergoing maintenance. Please check back shortly.", parse_mode="HTML")
@@ -349,9 +356,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         elif data == "admin_home":
+            context.user_data['state'] = None
             kb = [
                 [InlineKeyboardButton("📊 Analytics", callback_data="adm_analytics"), InlineKeyboardButton("⚡ Flash Sale", callback_data="adm_flash")],
-                [InlineKeyboardButton("📦 Add Stock", callback_data="adm_add_acc"), InlineKeyboardButton("🗑️ Del Stock", callback_data="adm_del_stock")],
+                [InlineKeyboardButton("📦 Add New Stock", callback_data="adm_add_acc"), InlineKeyboardButton("✏️ Manage Stock", callback_data="adm_man_stock")],
                 [InlineKeyboardButton("📢 Broadcast", callback_data="adm_cast"), InlineKeyboardButton("👥 Manage User", callback_data="adm_manage_user")],
                 [InlineKeyboardButton("💰 Add Bal", callback_data="adm_add_bal"), InlineKeyboardButton("🎟️ Promos", callback_data="adm_promos")],
                 [InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"), InlineKeyboardButton("📧 Payment Config", callback_data="adm_pay_config")],
@@ -361,27 +369,125 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text("👑 <b>Executive Admin Dashboard</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
             return
             
+        # --- NEW INVENTORY MANAGEMENT FLOW ---
+        elif data == "adm_add_acc":
+            conn = sqlite3.connect("store.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT category FROM accounts WHERE is_sold = 0")
+            cats = cursor.fetchall()
+            conn.close()
+            
+            kb = [[InlineKeyboardButton(f"📁 {c[0]}", callback_data=f"setcat_{c[0]}")] for c in cats]
+            kb.append([InlineKeyboardButton("➕ Create New Category", callback_data="setcat_NEW")])
+            kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="admin_home")])
+            
+            await query.message.edit_text("📦 <b>Add Stock</b>\n\nSelect an existing category or create a new one:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            return
+            
+        elif data.startswith("setcat_"):
+            cat = data.split("setcat_")[1]
+            if cat == "NEW":
+                context.user_data['state'] = "wait_new_cat"
+                await query.message.edit_text("✍️ <b>New Category</b>\n\nSend the name for your new category:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_home")]]))
+            else:
+                context.user_data['add_cat'] = cat
+                context.user_data['state'] = "wait_title"
+                await query.message.edit_text(f"📁 <b>Category:</b> {cat}\n\n✍️ Send the Title for this account (e.g. 'Spam Free Indian'):", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_home")]]))
+            return
+
+        elif data == "adm_man_stock":
+            conn = sqlite3.connect("store.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT category, COUNT(*) FROM accounts WHERE is_sold = 0 GROUP BY category")
+            categories = cursor.fetchall()
+            conn.close()
+            kb = []
+            for cat, count in categories: 
+                kb.append([InlineKeyboardButton(f"📁 {cat} ({count})", callback_data=f"mancat_{cat}_0")])
+            kb.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_home")])
+            await query.message.edit_text("✏️ <b>Manage Inventory</b>\n\nSelect a category to view items:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            return
+            
+        elif data.startswith("mancat_"):
+            parts = data.split("_")
+            cat_name = parts[1]
+            page = int(parts[2])
+            conn = sqlite3.connect("store.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, title FROM accounts WHERE category = ? AND is_sold = 0 LIMIT 10 OFFSET ?", (cat_name, page * 10))
+            items = cursor.fetchall()
+            cursor.execute("SELECT COUNT(*) FROM accounts WHERE category = ? AND is_sold = 0", (cat_name,))
+            total = cursor.fetchone()[0]
+            conn.close()
+            
+            kb = [[InlineKeyboardButton(f"⚙️ Edit: {t}", callback_data=f"manitem_{i}")] for i, t in items]
+            nav = []
+            if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mancat_{cat_name}_{page-1}"))
+            if (page + 1) * 10 < total: nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mancat_{cat_name}_{page+1}"))
+            if nav: kb.append(nav)
+            kb.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="adm_man_stock")])
+            
+            await query.message.edit_text(f"📂 <b>{cat_name}</b> (Page {page+1})\nSelect an item to edit:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            return
+            
+        elif data.startswith("manitem_"):
+            item_id = int(data.split("_")[1])
+            conn = sqlite3.connect("store.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT title, price, password, category FROM accounts WHERE id = ?", (item_id,))
+            item = cursor.fetchone()
+            conn.close()
+            
+            if not item: return await query.answer("Item not found.", show_alert=True)
+            t, p, pw, cat = item[0], item[1], item[2], item[3]
+            
+            kb = [
+                [InlineKeyboardButton("📝 Edit Title", callback_data=f"editf_title_{item_id}"), InlineKeyboardButton("💰 Edit Price", callback_data=f"editf_price_{item_id}")],
+                [InlineKeyboardButton("🔐 Edit Password", callback_data=f"editf_pass_{item_id}")],
+                [InlineKeyboardButton("❌ Delete Item", callback_data=f"editf_del_{item_id}")],
+                [InlineKeyboardButton("🔙 Back to Category", callback_data=f"mancat_{cat}_0")]
+            ]
+            text = f"⚙️ <b>Manage Item</b>\n\n<b>ID:</b> <code>{item_id}</code>\n<b>Title:</b> {t}\n<b>Price:</b> Rs {p:.2f}\n<b>Password:</b> <code>{pw}</code>"
+            await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            return
+
+        elif data.startswith("editf_"):
+            parts = data.split("_")
+            action = parts[1]
+            item_id = parts[2]
+            
+            if action == "del":
+                conn = sqlite3.connect("store.db")
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM accounts WHERE id = ?", (item_id,))
+                conn.commit()
+                conn.close()
+                await query.answer("Item deleted!", show_alert=True)
+                await query.message.edit_text("✅ Item permanently deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Inventory", callback_data="adm_man_stock")]]))
+                return
+                
+            context.user_data['state'] = f"edititem_{action}_{item_id}"
+            prompt = "Title" if action == "title" else "Price (Rs)" if action == "price" else "2FA Password (send 'none' to remove)"
+            await query.message.edit_text(f"✍️ Send the new {prompt} for this item:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"manitem_{item_id}")]]))
+            return
+
+        # --- OLD ADMIN FUNCTIONS ---
         elif data == "adm_analytics":
             conn = sqlite3.connect("store.db")
             cursor = conn.cursor()
-            
             cursor.execute("SELECT SUM(CASE WHEN is_sold=1 THEN 1 ELSE 0 END), SUM(CASE WHEN is_sold=0 THEN 1 ELSE 0 END) FROM accounts")
             inv_stats = cursor.fetchone()
             sold, unsold = inv_stats[0] or 0, inv_stats[1] or 0
-            
             cursor.execute("SELECT SUM(price) FROM purchases")
             all_time = cursor.fetchone()[0] or 0.0
             cursor.execute("SELECT SUM(price) FROM purchases WHERE date(bought_at) = date('now')")
             today_rev = cursor.fetchone()[0] or 0.0
             cursor.execute("SELECT SUM(price) FROM purchases WHERE date(bought_at) >= date('now', '-7 days')")
             week_rev = cursor.fetchone()[0] or 0.0
-            
             cursor.execute("SELECT category, COUNT(*) FROM purchases GROUP BY category ORDER BY COUNT(*) DESC LIMIT 1")
             top_cat = cursor.fetchone()
             top_cat_str = f"{top_cat[0]} ({top_cat[1]} sales)" if top_cat else "N/A"
-            
             conn.close()
-            
             text = (
                 f"📊 <b>Store Analytics</b>\n\n"
                 f"💰 <b>Revenue:</b>\n"
@@ -428,52 +534,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_home")]]))
             return
 
-        elif data == "adm_del_stock":
-            conn = sqlite3.connect("store.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT category, COUNT(*) FROM accounts WHERE is_sold = 0 GROUP BY category")
-            categories = cursor.fetchall()
-            conn.close()
-            kb = []
-            for cat, count in categories: kb.append([InlineKeyboardButton(f"📁 {cat} ({count})", callback_data=f"delcat_{cat}_0")])
-            kb.append([InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_home")])
-            await query.message.edit_text("🗑️ <b>Delete Stock</b>\n\nSelect a category to view items:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-            return
-
-        elif data.startswith("delcat_"):
-            parts = data.split("_")
-            cat_name = parts[1]
-            page = int(parts[2])
-            conn = sqlite3.connect("store.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, title FROM accounts WHERE category = ? AND is_sold = 0 LIMIT 10 OFFSET ?", (cat_name, page * 10))
-            items = cursor.fetchall()
-            cursor.execute("SELECT COUNT(*) FROM accounts WHERE category = ? AND is_sold = 0", (cat_name,))
-            total = cursor.fetchone()[0]
-            conn.close()
-            
-            kb = [[InlineKeyboardButton(f"❌ Delete: {t}", callback_data=f"delitem_{i}")] for i, t in items]
-            
-            nav = []
-            if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"delcat_{cat_name}_{page-1}"))
-            if (page + 1) * 10 < total: nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"delcat_{cat_name}_{page+1}"))
-            if nav: kb.append(nav)
-                
-            kb.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="adm_del_stock")])
-            await query.message.edit_text(f"🗑️ <b>Delete items in {cat_name}</b> (Page {page+1}):", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-            return
-
-        elif data.startswith("delitem_"):
-            item_id = int(data.split("_")[1])
-            conn = sqlite3.connect("store.db")
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM accounts WHERE id = ?", (item_id,))
-            conn.commit()
-            conn.close()
-            await query.answer("Item permanently deleted!", show_alert=True)
-            await query.message.edit_text("✅ Item Deleted.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="adm_del_stock")]]))
-            return
-            
         elif data == "adm_pay_config":
             kb = [
                 [InlineKeyboardButton("Gmail ID", callback_data="set_g_id"), InlineKeyboardButton("App Password", callback_data="set_g_pass")], 
@@ -505,18 +565,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
             return
             
-        elif data == "adm_add_acc":
-            context.user_data['state'] = "adm_add_acc"
-            await query.message.edit_text("✍️ Send account details:\n<code>Category | Title | Price | Session_String</code>", parse_mode="HTML")
-            return
         elif data == "adm_cast":
             context.user_data['state'] = "adm_cast"
             await query.message.edit_text("📢 Send the broadcast message:", parse_mode="HTML")
             return
+            
         elif data == "adm_add_bal":
             context.user_data['state'] = "adm_add_bal"
             await query.message.edit_text("💰 Send User ID and Amount:\nExample: <code>123456789 50</code>", parse_mode="HTML")
             return
+            
         elif data.startswith("set_"):
             context.user_data['state'] = data
             await query.message.reply_text("✍️ Please send the new value:")
@@ -596,11 +654,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor = conn.cursor()
         cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
         balance = cursor.fetchone()[0]
-        cursor.execute("SELECT title, price, session_string, category FROM accounts WHERE id = ? AND is_sold = 0", (acc_id,))
+        
+        cursor.execute("SELECT title, price, session_string, category, password FROM accounts WHERE id = ? AND is_sold = 0", (acc_id,))
         acc = cursor.fetchone()
         
         if not acc: return await query.answer("❌ Error: Account sold out.", show_alert=True)
-        title, base_price, session_str, category = acc[0], float(acc[1]), acc[2], acc[3]
+        title, base_price, session_str, category, password = acc[0], float(acc[1]), acc[2], acc[3], acc[4]
         
         final_price = calculate_final_price(base_price, user_id)
         
@@ -608,7 +667,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (final_price, user_id))
         cursor.execute("UPDATE accounts SET is_sold = 1 WHERE id = ?", (acc_id,))
-        cursor.execute("INSERT INTO purchases (user_id, category, title, session_string, price) VALUES (?, ?, ?, ?, ?)", (user_id, category, title, session_str, final_price))
+        cursor.execute("INSERT INTO purchases (user_id, category, title, session_string, password, price) VALUES (?, ?, ?, ?, ?, ?)", (user_id, category, title, session_str, password, final_price))
         conn.commit()
         conn.close()
         
@@ -624,7 +683,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🚪 Bot Logout", callback_data="mgr_logout")],
             [InlineKeyboardButton("🔙 Store Main Menu", callback_data="back_home")]
         ]
-        text = f"📱 <b>Account Manager</b>\n\n<b>Item:</b> {title}\n<b>Phone Number:</b> <code>{phone}</code>\n\n<b>Session String (Backup):</b>\n<code>{session_str}</code>"
+        
+        text = f"📱 <b>Account Manager</b>\n\n<b>Item:</b> {title}\n<b>Phone Number:</b> <code>{phone}</code>\n"
+        if password and password.lower() != 'none':
+            text += f"<b>2FA Password:</b> <code>{password}</code>\n\n"
+        text += f"<b>Session String (Backup):</b>\n<code>{session_str}</code>"
+        
         await wait_msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
     # --- PURCHASE HISTORY ---
@@ -646,12 +710,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pur_id = int(data.split("_")[2])
         conn = sqlite3.connect("store.db")
         cursor = conn.cursor()
-        cursor.execute("SELECT title, session_string FROM purchases WHERE id = ? AND user_id = ?", (pur_id, user_id))
+        cursor.execute("SELECT title, session_string, password FROM purchases WHERE id = ? AND user_id = ?", (pur_id, user_id))
         pur = cursor.fetchone()
         conn.close()
         
         if not pur: return await query.answer("Error locating purchase.", show_alert=True)
-        title, session_str = pur[0], pur[1]
+        title, session_str, password = pur[0], pur[1], pur[2]
         
         context.user_data['managing_session'] = session_str
         wait_msg = await query.message.edit_text("🔄 <b>Re-Connecting to Account securely via Telethon...</b>", parse_mode="HTML")
@@ -663,7 +727,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🚪 Bot Logout", callback_data="mgr_logout")],
             [InlineKeyboardButton("🔙 Back to Purchases", callback_data="my_purchases")]
         ]
-        text = f"📱 <b>Account Manager (Recovered)</b>\n\n<b>Item:</b> {title}\n<b>Phone Number:</b> <code>{phone}</code>\n\n<b>Session String (Backup):</b>\n<code>{session_str}</code>"
+        
+        text = f"📱 <b>Account Manager (Recovered)</b>\n\n<b>Item:</b> {title}\n<b>Phone Number:</b> <code>{phone}</code>\n"
+        if password and password.lower() != 'none':
+            text += f"<b>2FA Password:</b> <code>{password}</code>\n\n"
+        text += f"<b>Session String (Backup):</b>\n<code>{session_str}</code>"
+        
         await wait_msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
     # --- PROMO REDEMPTION ---
@@ -771,6 +840,141 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text: return
     text = text.strip()
     state = context.user_data.get('state')
+
+    # --- TELETHON ADD STOCK FLOW ---
+    if is_admin(user_id) and state:
+        if state == "wait_new_cat":
+            context.user_data['add_cat'] = text
+            context.user_data['state'] = "wait_title"
+            await update.message.reply_text(f"📁 <b>Category:</b> {text}\n\n✍️ Send the Title for this account (e.g. 'Spam Free Indian'):", parse_mode="HTML")
+            return
+            
+        elif state == "wait_title":
+            context.user_data['add_title'] = text
+            context.user_data['state'] = "wait_price"
+            await update.message.reply_text("💰 Send the Price in Rs (e.g. 25):")
+            return
+            
+        elif state == "wait_price":
+            try:
+                context.user_data['add_price'] = float(text)
+                context.user_data['state'] = "wait_phone"
+                await update.message.reply_text("📱 Send the Telegram Phone Number with Country Code (e.g. +919447817055):")
+            except ValueError:
+                await update.message.reply_text("❌ Invalid price. Please send a valid number:")
+            return
+            
+        elif state == "wait_phone":
+            phone = text.replace(" ", "").replace("+", "")
+            wait_msg = await update.message.reply_text("🔄 <b>Connecting to Telegram API...</b>", parse_mode="HTML")
+            try:
+                client = TelegramClient(StringSession(), API_ID, API_HASH)
+                await client.connect()
+                sent_code = await client.send_code_request(phone)
+                
+                context.user_data['t_client'] = client
+                context.user_data['t_phone'] = phone
+                context.user_data['t_hash'] = sent_code.phone_code_hash
+                context.user_data['state'] = "wait_otp"
+                
+                await wait_msg.edit_text(f"📬 <b>OTP Sent!</b>\n\nTelegram has sent a login code to <code>+{phone}</code>.\n\n✍️ Enter the OTP below:", parse_mode="HTML")
+            except Exception as e:
+                await wait_msg.edit_text(f"❌ <b>Error:</b> {e}", parse_mode="HTML")
+                if 't_client' in context.user_data: await context.user_data['t_client'].disconnect()
+                context.user_data['state'] = None
+            return
+            
+        elif state == "wait_otp":
+            otp = text.replace(" ", "")
+            client = context.user_data.get('t_client')
+            phone = context.user_data.get('t_phone')
+            t_hash = context.user_data.get('t_hash')
+            wait_msg = await update.message.reply_text("🔄 Verifying OTP...")
+            
+            try:
+                await client.sign_in(phone=phone, code=otp, phone_code_hash=t_hash)
+                
+                # If we get here, NO password is required!
+                session_str = client.session.save()
+                await client.disconnect()
+                
+                cat = context.user_data['add_cat']
+                title = context.user_data['add_title']
+                price = context.user_data['add_price']
+                
+                conn = sqlite3.connect("store.db")
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO accounts (category, title, price, session_string, password) VALUES (?, ?, ?, ?, ?)", (cat, title, price, session_str, 'none'))
+                conn.commit()
+                conn.close()
+                
+                context.user_data.clear()
+                await wait_msg.edit_text(f"✅ <b>Stock Added!</b>\n\nAccount `{title}` successfully added to <b>{cat}</b>.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_home")]]))
+                
+            except SessionPasswordNeededError:
+                context.user_data['state'] = "wait_password"
+                await wait_msg.edit_text("🔐 <b>2FA Detected</b>\n\nThis account has 2-Step Verification enabled. Please enter the password:", parse_mode="HTML")
+            except PhoneCodeInvalidError:
+                await wait_msg.edit_text("❌ Invalid OTP Code. Please try again.")
+            except Exception as e:
+                await wait_msg.edit_text(f"❌ <b>Error:</b> {e}", parse_mode="HTML")
+                await client.disconnect()
+                context.user_data['state'] = None
+            return
+            
+        elif state == "wait_password":
+            password = text.strip()
+            client = context.user_data.get('t_client')
+            wait_msg = await update.message.reply_text("🔄 Verifying Password...")
+            
+            try:
+                await client.sign_in(password=password)
+                session_str = client.session.save()
+                await client.disconnect()
+                
+                cat = context.user_data['add_cat']
+                title = context.user_data['add_title']
+                price = context.user_data['add_price']
+                
+                conn = sqlite3.connect("store.db")
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO accounts (category, title, price, session_string, password) VALUES (?, ?, ?, ?, ?)", (cat, title, price, session_str, password))
+                conn.commit()
+                conn.close()
+                
+                context.user_data.clear()
+                await wait_msg.edit_text(f"✅ <b>Stock Added!</b>\n\nAccount `{title}` successfully added to <b>{cat}</b> with 2FA saved.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_home")]]))
+            except Exception as e:
+                await wait_msg.edit_text(f"❌ <b>Error:</b> {e}", parse_mode="HTML")
+                await client.disconnect()
+                context.user_data['state'] = None
+            return
+
+        # --- INVENTORY EDITING LOGIC ---
+        elif state.startswith("edititem_"):
+            parts = state.split("_")
+            action = parts[1]
+            item_id = int(parts[2])
+            
+            conn = sqlite3.connect("store.db")
+            cursor = conn.cursor()
+            
+            if action == "title":
+                cursor.execute("UPDATE accounts SET title = ? WHERE id = ?", (text, item_id))
+            elif action == "price":
+                try: text = float(text)
+                except: return await update.message.reply_text("❌ Invalid price. Must be a number.")
+                cursor.execute("UPDATE accounts SET price = ? WHERE id = ?", (text, item_id))
+            elif action == "pass":
+                cursor.execute("UPDATE accounts SET password = ? WHERE id = ?", (text, item_id))
+                
+            conn.commit()
+            conn.close()
+            context.user_data['state'] = None
+            
+            kb = [[InlineKeyboardButton("🔙 Back to Item", callback_data=f"manitem_{item_id}")]]
+            await update.message.reply_text("✅ Item updated successfully!", reply_markup=InlineKeyboardMarkup(kb))
+            return
 
     if state == "user_support_ticket":
         await context.bot.send_message(chat_id=ADMIN_ID, text=f"📩 <b>New Support Ticket</b>\n\n<b>From ID:</b> <code>{user_id}</code>\n<b>User:</b> @{update.effective_user.username}\n\n<b>Message:</b>\n{text}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Reply to User", callback_data=f"adm_reply_{user_id}")]]))
@@ -926,20 +1130,6 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
             except: await update.message.reply_text("❌ Invalid format. Use: USER_ID AMOUNT")
             return
             
-        if state == "adm_add_acc":
-            try:
-                category, title, price, session_str = [x.strip() for x in text.split("|")]
-                price = float(price)
-                conn = sqlite3.connect("store.db")
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO accounts (category, title, price, session_string) VALUES (?, ?, ?, ?)", (category, title, price, session_str))
-                conn.commit()
-                conn.close()
-                context.user_data['state'] = None
-                await update.message.reply_text(f"✅ Account added to {category}.")
-            except: await update.message.reply_text("❌ Error. Format: Category | Title | Price | Session_String")
-            return
-            
         if state == "adm_cast":
             context.user_data['state'] = None
             conn = sqlite3.connect("store.db")
@@ -995,7 +1185,6 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
 def main():
-    # Keep-Alive call triggers the Flask server for Render Free Tier
     keep_alive() 
     
     app = Application.builder().token(BOT_TOKEN).read_timeout(30).write_timeout(30).connect_timeout(30).pool_timeout(30).build()
