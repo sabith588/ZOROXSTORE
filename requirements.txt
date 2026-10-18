@@ -1,0 +1,7 @@
+python-telegram-bot>=20.0
+Telethon
+qrcode
+Pillow
+python-dotenv
+imap-tools
+Flask
