@@ -360,6 +360,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = [
                 [InlineKeyboardButton("📊 Analytics", callback_data="adm_analytics"), InlineKeyboardButton("⚡ Flash Sale", callback_data="adm_flash")],
                 [InlineKeyboardButton("📦 Add New Stock", callback_data="adm_add_acc"), InlineKeyboardButton("✏️ Manage Stock", callback_data="adm_man_stock")],
+                [InlineKeyboardButton("🩺 Health Check", callback_data="adm_health"), InlineKeyboardButton("🔎 Lookup TXN", callback_data="adm_lookup_txn")],
                 [InlineKeyboardButton("📢 Broadcast", callback_data="adm_cast"), InlineKeyboardButton("👥 Manage User", callback_data="adm_manage_user")],
                 [InlineKeyboardButton("💰 Add Bal", callback_data="adm_add_bal"), InlineKeyboardButton("🎟️ Promos", callback_data="adm_promos")],
                 [InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"), InlineKeyboardButton("📧 Payment Config", callback_data="adm_pay_config")],
@@ -369,6 +370,53 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text("👑 <b>Executive Admin Dashboard</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
             return
             
+        elif data == "adm_lookup_txn":
+            context.user_data['state'] = "adm_lookup_txn"
+            await query.message.edit_text("🔎 <b>Lookup Transaction</b>\n\nSend me the Order ID (`#TG123`) or Deposit ID (`#DEP456`) to unmask it:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="admin_home")]]))
+            return
+            
+        # --- HEALTH CHECKER ENGINE ---
+        elif data == "adm_health":
+            conn = sqlite3.connect("store.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, session_string FROM accounts WHERE is_sold = 0")
+            unsold_accs = cursor.fetchall()
+            
+            if not unsold_accs:
+                conn.close()
+                return await query.message.edit_text("🩺 <b>Stock Health Check</b>\n\nYou currently have 0 unsold accounts in your inventory.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_home")]]))
+
+            wait_msg = await query.message.edit_text(f"🩺 <b>Health Check Initiated</b>\n\nChecking <b>{len(unsold_accs)}</b> unsold accounts. The bot is actively pinging Telegram servers. This may take a minute...\n\n<i>Please wait...</i>", parse_mode="HTML")
+            
+            alive = 0
+            dead = 0
+            
+            for acc_id, session_str in unsold_accs:
+                try:
+                    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                    await client.connect()
+                    
+                    if await client.is_user_authorized():
+                        alive += 1
+                    else:
+                        dead += 1
+                        cursor.execute("DELETE FROM accounts WHERE id = ?", (acc_id,))
+                    await client.disconnect()
+                except Exception:
+                    dead += 1
+                    cursor.execute("DELETE FROM accounts WHERE id = ?", (acc_id,))
+            
+            conn.commit()
+            conn.close()
+            
+            text = f"🩺 <b>Health Check Complete!</b>\n\n"
+            text += f"✅ <b>Healthy Accounts:</b> {alive}\n"
+            text += f"💀 <b>Dead Accounts Removed:</b> {dead}\n\n"
+            text += "<i>Your store inventory is now 100% clean and verified.</i>"
+            
+            await wait_msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Dashboard", callback_data="admin_home")]]))
+            return
+
         # --- NEW INVENTORY MANAGEMENT FLOW ---
         elif data == "adm_add_acc":
             conn = sqlite3.connect("store.db")
@@ -665,13 +713,37 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if balance < final_price: return await query.answer(f"❌ Insufficient Balance!", show_alert=True)
             
+        # Deduct balance and update stock
         cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (final_price, user_id))
         cursor.execute("UPDATE accounts SET is_sold = 1 WHERE id = ?", (acc_id,))
+        
+        # Save purchase and get the unique Order ID
         cursor.execute("INSERT INTO purchases (user_id, category, title, session_string, password, price) VALUES (?, ?, ?, ?, ?, ?)", (user_id, category, title, session_str, password, final_price))
+        purchase_id = cursor.lastrowid
         conn.commit()
         conn.close()
         
-        await send_receipt(context, f"🛒 <b>Verified Purchase</b>\n\n<b>Item:</b> {title}\n<b>Value:</b> Rs {final_price:.2f}\n<b>Store:</b> {get_set('store_name')}")
+        # Generate Privacy Receipt Data
+        u_name = update.effective_user.username or update.effective_user.first_name or "User"
+        masked_name = f"{u_name[:3]}***" if len(u_name) > 3 else f"{u_name}***"
+        today = datetime.now().strftime('%d/%m/%Y')
+        bot_user = context.bot.username
+
+        receipt_text = (
+            f"🧾 <b>PURCHASE SUCCESSFUL</b>\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🤖 <b>Bot:</b> @{bot_user}\n"
+            f"📦 <b>Item:</b> {title}\n"
+            f"👤 <b>Username:</b> @{masked_name}\n"
+            f"💰 <b>Price:</b> ₹{final_price:.2f}\n"
+            f"💳 <b>Payment:</b> Bot Balance\n"
+            f"🆔 <b>Order ID:</b> #TG{purchase_id}\n"
+            f"📅 <b>Date:</b> {today}\n"
+            f"✅ <b>Status:</b> Completed\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"💎 Thank you for purchasing!"
+        )
+        await send_receipt(context, receipt_text)
 
         context.user_data['managing_session'] = session_str
         wait_msg = await query.message.edit_text("🔄 <b>Connecting to Account securely via Telethon... Please wait.</b>", parse_mode="HTML")
@@ -840,6 +912,40 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text: return
     text = text.strip()
     state = context.user_data.get('state')
+
+    # --- ADMIN LOOKUP ENGINE ---
+    if is_admin(user_id) and state:
+        
+        if state == "adm_lookup_txn":
+            txn_id = text.strip().upper()
+            conn = sqlite3.connect("store.db")
+            cursor = conn.cursor()
+            
+            if txn_id.startswith("#TG") or txn_id.startswith("TG"):
+                pid = txn_id.replace("#TG", "").replace("TG", "")
+                cursor.execute("SELECT p.user_id, p.title, p.price, p.bought_at, u.username FROM purchases p LEFT JOIN users u ON p.user_id = u.user_id WHERE p.id = ?", (pid,))
+                res = cursor.fetchone()
+                if res:
+                    msg = f"🔎 <b>Order Lookup Result:</b>\n\n<b>Order ID:</b> {txn_id}\n<b>User ID:</b> <code>{res[0]}</code>\n<b>Username:</b> @{res[4]}\n<b>Item:</b> {res[1]}\n<b>Price:</b> ₹{res[2]:.2f}\n<b>Date:</b> {res[3]}"
+                else:
+                    msg = "❌ Order not found in database."
+            
+            elif txn_id.startswith("#DEP") or txn_id.startswith("DEP"):
+                did = txn_id.replace("#DEP", "").replace("DEP", "")
+                cursor.execute("SELECT c.user_id, c.amount, c.user_input, u.username FROM claimed_emails c LEFT JOIN users u ON c.user_id = u.user_id WHERE c.email_uid = ?", (did,))
+                res = cursor.fetchone()
+                if res:
+                    msg = f"🔎 <b>Deposit Lookup Result:</b>\n\n<b>Deposit ID:</b> {txn_id}\n<b>User ID:</b> <code>{res[0]}</code>\n<b>Username:</b> @{res[3]}\n<b>Amount:</b> ₹{res[1]:.2f}\n<b>UTR/TXN:</b> <code>{res[2]}</code>"
+                else:
+                    msg = "❌ Deposit not found in database."
+            
+            else:
+                msg = "❌ Invalid format. Please send an ID starting with #TG or #DEP."
+                
+            conn.close()
+            context.user_data['state'] = None
+            await update.message.reply_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_home")]]))
+            return
 
     # --- TELETHON ADD STOCK FLOW ---
     if is_admin(user_id) and state:
@@ -1177,11 +1283,51 @@ async def handle_message_input(update: Update, context: ContextTypes.DEFAULT_TYP
             if cursor.rowcount > 0:
                 cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
                 conn.commit()
-                await wait_msg.edit_text(f"✅ <b>Payment Verified!</b>\n\nRs {amount:.2f} credited to your wallet.", parse_mode="HTML")
-                await send_receipt(context, f"💰 <b>New Deposit Verified!</b>\n\n<b>Amount:</b> Rs {amount:.2f}\n<b>User ID:</b> <code>{user_id}</code>")
-            else: await wait_msg.edit_text("❌ <b>Security Alert</b>: This transaction has already been claimed.", parse_mode="HTML")
+                
+                # Create Privacy Masking for Public Receipt
+                u_name = update.effective_user.username or update.effective_user.first_name or "User"
+                masked_name = f"{u_name[:3]}***" if len(u_name) > 3 else f"{u_name}***"
+                str_uid = str(user_id)
+                masked_uid = f"{str_uid[:3]}****{str_uid[-3:]}" if len(str_uid) > 5 else f"{str_uid}***"
+                today = datetime.now().strftime('%d/%m/%Y')
+                bot_user = context.bot.username
+
+                # Send directly to the User
+                user_msg = (
+                    f"💰 <b>DEPOSIT RECEIPT</b>\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🤖 <b>Bot:</b> @{bot_user}\n"
+                    f"🆔 <b>Deposit ID:</b> #DEP{email_uid}\n"
+                    f"💵 <b>Amount:</b> ₹{amount:.2f}\n"
+                    f"💳 <b>Method:</b> UPI\n"
+                    f"📅 <b>Date:</b> {today}\n"
+                    f"✅ <b>Status:</b> Successful\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"💎 Amount has been credited to your bot balance.\n"
+                    f"🙏 Thank you for using our bot!"
+                )
+                await wait_msg.edit_text(user_msg, parse_mode="HTML")
+                
+                # Send to Public Receipt Channel (with privacy)
+                public_receipt = (
+                    f"💰 <b>DEPOSIT RECEIPT</b>\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"🤖 <b>Bot:</b> @{bot_user}\n"
+                    f"🆔 <b>Deposit ID:</b> #DEP{email_uid}\n"
+                    f"👤 <b>User:</b> {masked_name}\n"
+                    f"🆔 <b>User ID:</b> <code>{masked_uid}</code>\n"
+                    f"💵 <b>Amount:</b> ₹{amount:.2f}\n"
+                    f"💳 <b>Method:</b> UPI\n"
+                    f"📅 <b>Date:</b> {today}\n"
+                    f"✅ <b>Status:</b> Successful\n"
+                    f"━━━━━━━━━━━━━━"
+                )
+                await send_receipt(context, public_receipt)
+            else: 
+                await wait_msg.edit_text("❌ <b>Security Alert</b>: This transaction has already been claimed.", parse_mode="HTML")
             conn.close()
-        else: await wait_msg.edit_text("❌ <b>Payment not found.</b> Verify your UTR/Transaction ID, or wait 60 seconds for banking delays and try again.", parse_mode="HTML")
+        else: 
+            await wait_msg.edit_text("❌ <b>Payment not found.</b> Verify your UTR/Transaction ID, or wait 60 seconds for banking delays and try again.", parse_mode="HTML")
         return
 
 def main():
